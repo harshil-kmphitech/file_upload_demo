@@ -44,6 +44,7 @@ class _ChunkUploaderScreenState extends State<ChunkUploaderScreen> {
         for (final file in result.files) {
           if (file.path == null) continue;
 
+          printAction('---filepath = ${file.path}---');
           final f = File(file.path!);
           ChunkedUploader().handleNewUpload(f.path, (msg) {
             printSuccess('---UPLOAD STATUS: $msg');
@@ -84,7 +85,7 @@ class ChunkedUploader {
   ChunkedUploader({
     this.uploadUrl = uploadURL,
     this.checkChunkUrl = checkChunkURL,
-    this.chunkSize = 1024 * 1024 * 2, // 2MB
+    this.chunkSize = 1024 * 1024 * 5, // 5MB
     this.maxConcurrentUploads = 5,
   });
 
@@ -105,11 +106,20 @@ class ChunkedUploader {
     while (offset < totalSize) {
       final end = (offset + chunkSize > totalSize) ? totalSize : offset + chunkSize;
 
-      if (uploadedChunks.contains(index) || await chunkExistsOnServer(fileName, index)) {
+      printAction('--- uploadedChunks 111 = $uploadedChunks --- index = $index');
+
+      // printAction('--- uploadedChunks.contains(index) = ${uploadedChunks.contains(index)} --- index = $index');
+      // printAction('--- condition = ${uploadedChunks.contains(index) || await chunkExistsOnServer(fileName, index)} --- index = $index');
+
+      if (await chunkExistsOnServer(fileName, index) && uploadedChunks.contains(index)) {
         offset = end;
         index++;
         continue;
       }
+
+      printAction('--- uploadedChunks 222 = $uploadedChunks --- index = $index');
+
+      // printSuccess('--- index = $index --- offset = $offset --- end = $end --- totalSize = $totalSize');
 
       final chunk = await file.openRead(offset, end).reduce((a, b) => a + b);
       final formData = FormData.fromMap({
@@ -118,13 +128,17 @@ class ChunkedUploader {
         'index': index.toString(),
         'isLast': (end == totalSize).toString(),
       });
+      // printWarning('--- fileName.partindex = $fileName.part$index --- Started uploading');
+      printError('--- uploadedChunks 33333333 = $uploadedChunks --- index = $index');
 
-      final uploadFuture = dio.post(uploadUrl, data: formData).then((_) {
+      final uploadFuture = await dio.post(uploadUrl, data: formData).then((_) {
+        // printWarning('--- fileName.partindex then = $fileName.part$index --- Uploaded');
+        printAction('--- uploadedChunks 333 = $uploadedChunks --- index = $index');
         uploadedChunks.add(index);
         prefs.setStringList(uploadedChunksKey, uploadedChunks.map((e) => e.toString()).toList());
       });
 
-      activeUploads.add(uploadFuture);
+      activeUploads.add(Future.value(uploadFuture));
 
       if (activeUploads.length >= maxConcurrentUploads) {
         await Future.wait(activeUploads);
@@ -132,7 +146,9 @@ class ChunkedUploader {
       }
 
       offset = end;
+      printAction('--- uploadedChunks 444 = $uploadedChunks --- index = $index');
       index++;
+      printAction('--- uploadedChunks 555 = $uploadedChunks --- index = $index');
     }
 
     if (activeUploads.isNotEmpty) {
@@ -152,7 +168,7 @@ class ChunkedUploader {
         'originalname': fileName,
         'index': index.toString(),
       });
-      printWarning('--- chunkExistsOnServer response = ${response.data}');
+      printWarning('--- chunkExistsOnServer response = ${response.data} --- fileName = $fileName --- index = $index');
 
       return response.data['exists'] == true;
     } catch (_) {
