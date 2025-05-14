@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:isolate';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../helpers/all.dart';
+
+const String uploadURL = 'https://hexanetwork.in:3035/upload';
+const String checkChunkURL = 'https://hexanetwork.in:3035/check-chunk';
 
 class ChunkUploaderScreen extends StatefulWidget {
   const ChunkUploaderScreen({super.key});
@@ -14,7 +17,13 @@ class ChunkUploaderScreen extends StatefulWidget {
 }
 
 class _ChunkUploaderScreenState extends State<ChunkUploaderScreen> {
-  final String uploadUrl = 'https://hexanetwork.in:3035/upload';
+  @override
+  void initState() {
+    super.initState();
+    ChunkedUploader().resumePendingUploads((msg) {
+      printSuccess('---RESUMED UPLOAD: $msg');
+    });
+  }
 
   Future<void> pickAndUploadFiles() async {
     FilePickerResult? result;
@@ -33,97 +42,18 @@ class _ChunkUploaderScreenState extends State<ChunkUploaderScreen> {
       try {
         printWarning('-----=== result.files.length = ${result.files.length}');
         for (final file in result.files) {
-          printAction('-----=== 111');
+          if (file.path == null) continue;
+
           final f = File(file.path!);
-          final receivePort = ReceivePort();
-          printAction('-----=== 222');
-          await Isolate.spawn(uploadFileInChunks, {
-            'sendPort': receivePort.sendPort,
-            'filePath': f.path,
-            'uploadUrl': uploadUrl,
-          });
-          printAction('-----=== 333');
-          receivePort.listen((msg) {
+          ChunkedUploader().handleNewUpload(f.path, (msg) {
             printSuccess('---UPLOAD STATUS: $msg');
-            Utils().showToast(message: 'File uploaded');
+            // Utils().showToast(message: 'File uploaded');
+            Utils().showToast(message: msg);
           });
-          printAction('-----=== 444');
         }
       } catch (e) {
         printError('--- pickAndUploadFiles catch error = $e  ---');
       }
-    }
-  }
-
-  static Future<void> uploadFileInChunks(Map<String, dynamic> args) async {
-    printAction('-----=== uploadFileInChunks');
-    final sendPort = args['sendPort'] as SendPort;
-    final filePath = args['filePath'] as String;
-    final uploadUrl = args['uploadUrl'] as String;
-
-    final file = File(filePath);
-    final fileName = file.uri.pathSegments.last;
-    const chunkSize = 1024 * 1024 * 5; // 5MB
-    final totalSize = file.lengthSync();
-    final dio = Dio();
-
-    var offset = 0;
-    var index = 0;
-    List<Future> activeUploads = [];
-    const int maxConcurrentUploads = 5;
-
-    try {
-      while (offset < totalSize) {
-        printAction('---offset = $offset < totalSize = $totalSize --- ${offset < totalSize}---');
-        printAction('---index = $index---');
-        final end = (offset + chunkSize > totalSize) ? totalSize : offset + chunkSize;
-        final chunk = file.readAsBytesSync().sublist(offset, end);
-
-        final formData = FormData.fromMap({
-          'file': MultipartFile.fromBytes(chunk, filename: '$fileName.part$index'),
-          'originalname': fileName,
-          'index': index.toString(),
-          'isLast': (end == totalSize).toString(),
-        });
-
-        final uploadFuture = dio.post(
-          uploadUrl,
-          data: formData,
-          options: Options(
-            contentType: 'multipart/form-data',
-            headers: {
-              'Content-Type': 'multipart/form-data',
-            },
-          ),
-          onSendProgress: (sent, total) {
-            printAction("Chunk progress: ${sent / total * 100}%");
-          },
-        );
-
-        activeUploads.add(uploadFuture);
-
-        printAction('----- activeUploads.length = ${activeUploads.length}');
-
-        // If we hit the maxConcurrentUploads, wait for all to complete
-        if (activeUploads.length >= maxConcurrentUploads) {
-          await Future.wait(activeUploads);
-          activeUploads.clear();
-        }
-
-        offset = end;
-        index++;
-        printAction('---index++ = $index---');
-      }
-
-      // Wait for any remaining uploads to complete
-      if (activeUploads.isNotEmpty) {
-        await Future.wait(activeUploads);
-      }
-
-      sendPort.send('$fileName uploaded');
-      printAction('--- $fileName uploaded ---');
-    } catch (e) {
-      printError('--- uploadFileInChunks catch error = $e  ---');
     }
   }
 
@@ -138,15 +68,6 @@ class _ChunkUploaderScreenState extends State<ChunkUploaderScreen> {
               onPressed: pickAndUploadFiles,
               child: const Text('Select & Upload'),
             ),
-            ElevatedButton(
-              onPressed: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: (context) => const NextScreen()),
-                );
-              },
-              child: const Text('Next Screen'),
-            ),
           ],
         ),
       ),
@@ -154,18 +75,128 @@ class _ChunkUploaderScreenState extends State<ChunkUploaderScreen> {
   }
 }
 
-class NextScreen extends StatelessWidget {
-  const NextScreen({super.key});
+class ChunkedUploader {
+  final String uploadUrl;
+  final String checkChunkUrl;
+  final int chunkSize;
+  final int maxConcurrentUploads;
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Center(
-        child: Text(
-          'First Screen',
-          style: Theme.of(context).textTheme.headlineLarge,
-        ),
-      ),
-    );
+  ChunkedUploader({
+    this.uploadUrl = uploadURL,
+    this.checkChunkUrl = checkChunkURL,
+    this.chunkSize = 1024 * 1024 * 2, // 2MB
+    this.maxConcurrentUploads = 5,
+  });
+
+  Future<void> uploadFileInChunks(String filePath, void Function(String) onDone) async {
+    final file = File(filePath);
+    final fileName = file.uri.pathSegments.last;
+    final totalSize = await file.length();
+    final dio = Dio();
+    final prefs = await SharedPreferences.getInstance();
+
+    final uploadedChunksKey = 'uploaded_chunks_$fileName';
+    Set<int> uploadedChunks = (prefs.getStringList(uploadedChunksKey) ?? []).map(int.parse).toSet();
+
+    int offset = 0;
+    int index = 0;
+    List<Future> activeUploads = [];
+
+    while (offset < totalSize) {
+      final end = (offset + chunkSize > totalSize) ? totalSize : offset + chunkSize;
+
+      if (uploadedChunks.contains(index) || await chunkExistsOnServer(fileName, index)) {
+        offset = end;
+        index++;
+        continue;
+      }
+
+      final chunk = await file.openRead(offset, end).reduce((a, b) => a + b);
+      final formData = FormData.fromMap({
+        'file': MultipartFile.fromBytes(chunk, filename: '$fileName.part$index'),
+        'originalname': fileName,
+        'index': index.toString(),
+        'isLast': (end == totalSize).toString(),
+      });
+
+      final uploadFuture = dio.post(uploadUrl, data: formData).then((_) {
+        uploadedChunks.add(index);
+        prefs.setStringList(uploadedChunksKey, uploadedChunks.map((e) => e.toString()).toList());
+      });
+
+      activeUploads.add(uploadFuture);
+
+      if (activeUploads.length >= maxConcurrentUploads) {
+        await Future.wait(activeUploads);
+        activeUploads.clear();
+      }
+
+      offset = end;
+      index++;
+    }
+
+    if (activeUploads.isNotEmpty) {
+      await Future.wait(activeUploads);
+    }
+
+    await prefs.remove(uploadedChunksKey);
+    await removePendingUpload(filePath);
+
+    printWarning('--- uploadFileInChunks done');
+    onDone('$fileName uploaded');
+  }
+
+  Future<bool> chunkExistsOnServer(String fileName, int index) async {
+    try {
+      final response = await Dio().get(checkChunkUrl, queryParameters: {
+        'originalname': fileName,
+        'index': index.toString(),
+      });
+      printWarning('--- chunkExistsOnServer response = ${response.data}');
+
+      return response.data['exists'] == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Track pending uploads for app restarts
+  Future<void> addPendingUpload(String filePath) async {
+    final prefs = await SharedPreferences.getInstance();
+    final uploads = prefs.getStringList('pending_uploads') ?? [];
+    printWarning('--- addPendingUpload uploads = $uploads');
+
+    if (!uploads.contains(filePath)) {
+      uploads.add(filePath);
+      await prefs.setStringList('pending_uploads', uploads);
+    }
+  }
+
+  Future<void> removePendingUpload(String filePath) async {
+    final prefs = await SharedPreferences.getInstance();
+    final uploads = prefs.getStringList('pending_uploads') ?? [];
+    printWarning('--- removePendingUpload uploads = $uploads');
+
+    uploads.remove(filePath);
+    await prefs.setStringList('pending_uploads', uploads);
+  }
+
+  /// Called when user selects new files
+  Future<void> handleNewUpload(String filePath, void Function(String) onDone) async {
+    await addPendingUpload(filePath);
+    await uploadFileInChunks(filePath, onDone);
+  }
+
+  /// Called on app startup to resume previous uploads
+  Future<void> resumePendingUploads(void Function(String) onDone) async {
+    final prefs = await SharedPreferences.getInstance();
+    final uploads = prefs.getStringList('pending_uploads') ?? [];
+    printWarning('--- resumePendingUploads uploads = ${uploads.length}');
+
+    for (final filePath in uploads) {
+      if (await File(filePath).exists()) {
+        await uploadFileInChunks(filePath, onDone);
+      }
+    }
   }
 }
